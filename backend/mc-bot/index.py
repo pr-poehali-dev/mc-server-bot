@@ -99,7 +99,7 @@ def handler(event: dict, context) -> dict:
             lines = ["<b>Список серверов:</b>\n"]
             for i, (ip, version, uname, added_at) in enumerate(servers, 1):
                 date_str = added_at.strftime('%d.%m.%Y') if added_at else ''
-                lines.append(f"{i}. <code>{ip}</code> | Версия: {version} | Добавил: @{uname} | {date_str}")
+                lines.append(f"{i}. <code>{ip}</code>\nВерсия: {version} | Добавил: @{uname} | {date_str}")
             send_message(token, chat_id, "\n".join(lines), get_main_keyboard())
 
     elif state and state.get('step') == 'await_ip':
