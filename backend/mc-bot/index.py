@@ -9,7 +9,6 @@ import urllib.request
 
 SCHEMA = os.environ.get('MAIN_DB_SCHEMA', 't_p38250381_mc_server_bot')
 PAGE_SIZE = 5
-
 user_states = {}
 
 LAUNCH_PHRASES = [
@@ -22,6 +21,26 @@ LAUNCH_PHRASES = [
 ]
 
 SCORE_LABELS = {1: "😡 Ужасно", 2: "😕 Плохо", 3: "😐 Норм", 4: "😊 Хорошо", 5: "🤩 Огонь!"}
+
+# ─── Система достижений ───────────────────────────────────────────────────────
+# code: (emoji, название, описание)
+ALL_ACHIEVEMENTS = {
+    "first_server":    ("🌱", "Первый шаг",        "Добавил первый сервер"),
+    "three_servers":   ("🖥️", "Коллекционер",       "Добавил 3 сервера"),
+    "five_servers":    ("🏗️", "Строитель каталога", "Добавил 5 серверов"),
+    "first_vote":      ("🗳️", "Первый голос",       "Оценил сервер впервые"),
+    "ten_votes":       ("⚡", "Активный критик",    "Оценил 10 серверов"),
+    "first_fav":       ("⭐", "Коллекционер звёзд", "Добавил первый сервер в избранное"),
+    "popular_100":     ("👁️", "Популярный",         "Твой сервер набрал 100 просмотров"),
+    "popular_500":     ("🔥", "Горячий",            "Твой сервер набрал 500 просмотров"),
+    "popular_1000":    ("💎", "Легенда каталога",   "Твой сервер набрал 1000 просмотров"),
+    "rated_high":      ("🌟", "Звезда",             "Твой сервер получил рейтинг 4.5+"),
+    "top_1":           ("👑", "Король сервера",     "Твой сервер занял 1 место в топе"),
+    "veteran":         ("🚀", "Ветеран",            "С момента регистрации прошло 30 дней"),
+    "night_owl":       ("🦉", "Ночная сова",        "Добавил сервер между 00:00 и 05:00"),
+    "perfectionist":   ("💯", "Перфекционист",      "Добавил сервер с описанием и хостингом"),
+    "loyal_voter":     ("🎖️", "Верный оценщик",     "Голосовал 3 недели подряд"),
+}
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
@@ -47,9 +66,9 @@ def get_main_keyboard():
     return json.dumps({
         "keyboard": [
             [{"text": "➕ ДОБАВИТЬ СЕРВЕР"}, {"text": "🌐 СЕРВЕРЫ"}],
-            [{"text": "🏆 ТОП СЕРВЕРОВ"}, {"text": "⭐ ИЗБРАННОЕ"}],
-            [{"text": "📋 МОИ СЕРВЕРЫ"}, {"text": "✏️ ИЗМЕНИТЬ ОПИСАНИЕ"}],
-            [{"text": "📊 МОЯ СТАТИСТИКА"}]
+            [{"text": "🏆 ТОП СЕРВЕРОВ"},   {"text": "⭐ ИЗБРАННОЕ"}],
+            [{"text": "📋 МОИ СЕРВЕРЫ"},    {"text": "✏️ ИЗМЕНИТЬ ОПИСАНИЕ"}],
+            [{"text": "📊 МОЯ СТАТИСТИКА"}, {"text": "🏅 МОИ АЧИВКИ"}],
         ],
         "resize_keyboard": True
     })
@@ -179,7 +198,6 @@ def get_user_favorite_ids(user_id):
     return ids
 
 def cast_vote(user_id, server_id, score):
-    """Голосует за сервер. Обновляет если уже голосовал на этой неделе. Возвращает (is_new, old_score)."""
     now = datetime.datetime.utcnow()
     week = int(now.strftime('%V'))
     year = now.year
@@ -192,16 +210,12 @@ def cast_vote(user_id, server_id, score):
     existing = cur.fetchone()
     if existing:
         old_score = existing[1]
-        cur.execute(
-            f"UPDATE {SCHEMA}.votes SET score = %s, voted_at = now() WHERE id = %s",
-            (score, existing[0])
-        )
+        cur.execute(f"UPDATE {SCHEMA}.votes SET score = %s, voted_at = now() WHERE id = %s", (score, existing[0]))
         cur.execute(
             f"UPDATE {SCHEMA}.servers SET rating_sum = rating_sum - %s + %s WHERE id = %s",
             (old_score, score, server_id)
         )
-        conn.commit()
-        cur.close(); conn.close()
+        conn.commit(); cur.close(); conn.close()
         return False, old_score
     else:
         cur.execute(
@@ -212,8 +226,7 @@ def cast_vote(user_id, server_id, score):
             f"UPDATE {SCHEMA}.servers SET rating_sum = rating_sum + %s, rating_count = rating_count + 1 WHERE id = %s",
             (score, server_id)
         )
-        conn.commit()
-        cur.close(); conn.close()
+        conn.commit(); cur.close(); conn.close()
         return True, None
 
 def get_user_vote_this_week(user_id, server_id):
@@ -240,8 +253,7 @@ def get_user_stats(user_id):
     cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.votes WHERE user_id = %s", (user_id,))
     votes_given = cur.fetchone()[0]
     cur.execute(
-        f"""SELECT COALESCE(SUM(s.views), 0), COALESCE(SUM(s.rating_count), 0)
-            FROM {SCHEMA}.servers s WHERE s.user_id = %s""",
+        f"SELECT COALESCE(SUM(s.views), 0), COALESCE(SUM(s.rating_count), 0) FROM {SCHEMA}.servers s WHERE s.user_id = %s",
         (user_id,)
     )
     row = cur.fetchone()
@@ -272,10 +284,127 @@ def get_server_for_vote(server_id):
     cur.close(); conn.close()
     return row
 
+# ─── Достижения ───────────────────────────────────────────────────────────────
+
+def get_user_achievements(user_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(f"SELECT code, unlocked_at FROM {SCHEMA}.achievements WHERE user_id = %s ORDER BY unlocked_at", (user_id,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return {r[0]: r[1] for r in rows}
+
+def unlock_achievement(user_id, code):
+    """Разблокирует ачивку. Возвращает True если только что получена (новая)."""
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(f"SELECT id FROM {SCHEMA}.achievements WHERE user_id = %s AND code = %s", (user_id, code))
+    if cur.fetchone():
+        cur.close(); conn.close()
+        return False
+    cur.execute(f"INSERT INTO {SCHEMA}.achievements (user_id, code) VALUES (%s, %s)", (user_id, code))
+    conn.commit()
+    cur.close(); conn.close()
+    return True
+
+def check_and_unlock(token, chat_id, user_id):
+    """Проверяет все условия и выдаёт новые ачивки с уведомлением."""
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.servers WHERE user_id = %s", (user_id,))
+    srv_count = cur.fetchone()[0]
+
+    cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.votes WHERE user_id = %s", (user_id,))
+    vote_count = cur.fetchone()[0]
+
+    cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.favorites WHERE user_id = %s", (user_id,))
+    fav_count = cur.fetchone()[0]
+
+    cur.execute(f"SELECT MAX(views) FROM {SCHEMA}.servers WHERE user_id = %s", (user_id,))
+    max_views_row = cur.fetchone()
+    max_views = max_views_row[0] or 0
+
+    cur.execute(
+        f"SELECT MAX(ROUND(rating_sum::numeric / rating_count, 2)) FROM {SCHEMA}.servers WHERE user_id = %s AND rating_count >= 3",
+        (user_id,)
+    )
+    max_rating_row = cur.fetchone()
+    max_rating = float(max_rating_row[0]) if max_rating_row and max_rating_row[0] else 0
+
+    cur.execute(
+        f"SELECT id FROM {SCHEMA}.servers WHERE user_id = %s ORDER BY views DESC LIMIT 1",
+        (user_id,)
+    )
+    my_top_server = cur.fetchone()
+    top_server_id = my_top_server[0] if my_top_server else None
+    is_top1 = False
+    if top_server_id:
+        cur.execute(f"SELECT id FROM {SCHEMA}.servers ORDER BY views DESC LIMIT 1")
+        global_top = cur.fetchone()
+        is_top1 = global_top and global_top[0] == top_server_id
+
+    cur.execute(f"SELECT MIN(added_at) FROM {SCHEMA}.servers WHERE user_id = %s", (user_id,))
+    first_added_row = cur.fetchone()
+    first_added = first_added_row[0] if first_added_row and first_added_row[0] else None
+    is_veteran = first_added and (datetime.datetime.utcnow() - first_added).days >= 30
+
+    cur.execute(
+        f"SELECT added_at FROM {SCHEMA}.servers WHERE user_id = %s ORDER BY added_at DESC LIMIT 1",
+        (user_id,)
+    )
+    last_srv_row = cur.fetchone()
+    is_night_owl = False
+    if last_srv_row and last_srv_row[0]:
+        h = last_srv_row[0].hour
+        is_night_owl = 0 <= h < 5
+
+    cur.execute(
+        f"SELECT description, hosting FROM {SCHEMA}.servers WHERE user_id = %s ORDER BY added_at DESC LIMIT 1",
+        (user_id,)
+    )
+    last_srv_data = cur.fetchone()
+    is_perfectionist = last_srv_data and last_srv_data[0] and last_srv_data[1]
+
+    # Проверяем кол-во уникальных недель голосований
+    cur.execute(
+        f"SELECT COUNT(DISTINCT (year_number * 100 + week_number)) FROM {SCHEMA}.votes WHERE user_id = %s",
+        (user_id,)
+    )
+    unique_weeks = cur.fetchone()[0]
+
+    cur.close(); conn.close()
+
+    candidates = []
+    if srv_count >= 1:   candidates.append("first_server")
+    if srv_count >= 3:   candidates.append("three_servers")
+    if srv_count >= 5:   candidates.append("five_servers")
+    if vote_count >= 1:  candidates.append("first_vote")
+    if vote_count >= 10: candidates.append("ten_votes")
+    if fav_count >= 1:   candidates.append("first_fav")
+    if max_views >= 100:  candidates.append("popular_100")
+    if max_views >= 500:  candidates.append("popular_500")
+    if max_views >= 1000: candidates.append("popular_1000")
+    if max_rating >= 4.5: candidates.append("rated_high")
+    if is_top1:          candidates.append("top_1")
+    if is_veteran:       candidates.append("veteran")
+    if is_night_owl:     candidates.append("night_owl")
+    if is_perfectionist: candidates.append("perfectionist")
+    if unique_weeks >= 3: candidates.append("loyal_voter")
+
+    for code in candidates:
+        if unlock_achievement(user_id, code):
+            emoji, name, desc = ALL_ACHIEVEMENTS[code]
+            send_message(token, chat_id,
+                f"🎉 <b>Новое достижение разблокировано!</b>\n\n"
+                f"{emoji} <b>{name}</b>\n"
+                f"<i>{desc}</i>"
+            )
+
 # ─── Minecraft Server List Ping ───────────────────────────────────────────────
 
 def get_mc_status(ip_port: str):
-    """Получает онлайн-статус и количество игроков через протокол Minecraft 1.7+."""
+    """Получает онлайн-статус и количество игроков через Minecraft Server List Ping 1.7+."""
     try:
         if ':' in ip_port:
             host, port = ip_port.rsplit(':', 1)
@@ -290,48 +419,37 @@ def get_mc_status(ip_port: str):
             while True:
                 part = val & 0x7F
                 val >>= 7
-                if val:
-                    part |= 0x80
+                if val: part |= 0x80
                 result += bytes([part])
-                if not val:
-                    break
+                if not val: break
             return result
 
         def read_varint(s):
             result, shift = 0, 0
             while True:
                 b = s.recv(1)
-                if not b:
-                    return 0
+                if not b: return 0
                 val = b[0]
                 result |= (val & 0x7F) << shift
-                if not (val & 0x80):
-                    return result
+                if not (val & 0x80): return result
                 shift += 7
 
         host_encoded = host.encode('utf-8')
         handshake = (
-            pack_varint(0x00) +
-            pack_varint(47) +
-            pack_varint(len(host_encoded)) +
-            host_encoded +
-            struct.pack('>H', port) +
-            pack_varint(1)
+            pack_varint(0x00) + pack_varint(47) +
+            pack_varint(len(host_encoded)) + host_encoded +
+            struct.pack('>H', port) + pack_varint(1)
         )
         sock.sendall(pack_varint(len(handshake)) + handshake)
         sock.sendall(pack_varint(1) + pack_varint(0x00))
-
-        read_varint(sock)
-        read_varint(sock)
+        read_varint(sock); read_varint(sock)
         length = read_varint(sock)
         data = b''
         while len(data) < length:
             chunk = sock.recv(length - len(data))
-            if not chunk:
-                break
+            if not chunk: break
             data += chunk
         sock.close()
-
         response = json.loads(data)
         players = response.get('players', {})
         return True, players.get('online', 0), players.get('max', 0)
@@ -341,16 +459,13 @@ def get_mc_status(ip_port: str):
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def stars_bar(rating):
-    """Визуальная полоска рейтинга: ★★★☆☆ 4.2"""
     if rating is None:
         return "☆ нет оценок"
     filled = round(float(rating))
-    bar = "★" * filled + "☆" * (5 - filled)
-    return f"{bar} {rating}"
+    return "★" * filled + "☆" * (5 - filled) + f" {rating}"
 
 def days_until_monday():
-    today = datetime.datetime.utcnow().weekday()
-    return 7 - today
+    return 7 - datetime.datetime.utcnow().weekday()
 
 # ─── UI builders ──────────────────────────────────────────────────────────────
 
@@ -362,20 +477,16 @@ def build_servers_page(servers, page, total):
         date_str = added_at.strftime('%d.%m.%Y') if added_at else ''
         status = f"🟢 {pl_on}/{pl_max}" if online else "🔴"
         line = f"{i}. <code>{ip}</code>"
-        if hosting:
-            line += f" <i>[{hosting}]</i>"
+        if hosting: line += f" <i>[{hosting}]</i>"
         line += f"\nВерсия: {version} | {status} | 👁 {views}"
         line += f"\n{stars_bar(rating)} | @{uname} {date_str}"
-        if description:
-            line += f"\n💬 {description}"
+        if description: line += f"\n💬 {description}"
         lines.append(line)
-
     nav_buttons = []
     if page > 0:
         nav_buttons.append({"text": "◀️ Назад", "callback_data": f"page_{page - 1}"})
     if (page + 1) * PAGE_SIZE < total:
         nav_buttons.append({"text": "Вперёд ▶️", "callback_data": f"page_{page + 1}"})
-
     markup = json.dumps({"inline_keyboard": [nav_buttons]}) if nav_buttons else None
     return "\n".join(lines), markup
 
@@ -390,26 +501,22 @@ def build_top_servers(servers, user_id):
         status = f"🟢 {pl_on}/{pl_max}" if online else "🔴"
         star = "⭐" if sid in fav_ids else ""
         line = f"{medal} {star}<code>{ip}</code>"
-        if hosting:
-            line += f" <i>[{hosting}]</i>"
+        if hosting: line += f" <i>[{hosting}]</i>"
         line += f"\nВерсия: {version} | {status} | 👁 {views}"
         line += f"\n{stars_bar(rating)}"
-        if description:
-            line += f"\n💬 {description}"
+        if description: line += f"\n💬 {description}"
         lines.append(line)
-
-        row = []
         fav_label = "★ Убрать" if sid in fav_ids else "☆ В избранное"
-        row.append({"text": fav_label, "callback_data": f"fav_{sid}"})
-        row.append({"text": "🗳️ Оценить", "callback_data": f"vote_{sid}"})
-        inline_buttons.append(row)
-
+        inline_buttons.append([
+            {"text": fav_label, "callback_data": f"fav_{sid}"},
+            {"text": "🗳️ Оценить", "callback_data": f"vote_{sid}"}
+        ])
     markup = json.dumps({"inline_keyboard": inline_buttons})
     return "\n".join(lines), markup
 
 def build_vote_keyboard(server_id):
     buttons = [[
-        {"text": f"{score} {'⭐' * score}", "callback_data": f"score_{server_id}_{score}"}
+        {"text": f"{'⭐' * score}", "callback_data": f"score_{server_id}_{score}"}
         for score in range(1, 6)
     ]]
     return json.dumps({"inline_keyboard": buttons})
@@ -423,15 +530,13 @@ def build_favorites(servers, user_id):
         online, pl_on, pl_max = get_mc_status(ip)
         status = f"🟢 {pl_on}/{pl_max}" if online else "🔴"
         line = f"⭐ <code>{ip}</code>"
-        if hosting:
-            line += f" <i>[{hosting}]</i>"
+        if hosting: line += f" <i>[{hosting}]</i>"
         line += f"\nВерсия: {version} | {status} | 👁 {views}"
         line += f"\n{stars_bar(rating)}"
-        if description:
-            line += f"\n💬 {description}"
+        if description: line += f"\n💬 {description}"
         lines.append(line)
         inline_buttons.append([
-            {"text": "★ Убрать из избранного", "callback_data": f"fav_{sid}"},
+            {"text": "★ Убрать", "callback_data": f"fav_{sid}"},
             {"text": "🗳️ Оценить", "callback_data": f"vote_{sid}"}
         ])
     markup = json.dumps({"inline_keyboard": inline_buttons})
@@ -442,11 +547,9 @@ def build_my_servers(servers):
     buttons = []
     for i, (sid, ip, version, description, hosting, rating, r_count) in enumerate(servers, 1):
         line = f"{i}. <code>{ip}</code>"
-        if hosting:
-            line += f" <i>[{hosting}]</i>"
+        if hosting: line += f" <i>[{hosting}]</i>"
         line += f"\nВерсия: {version} | {stars_bar(rating)} ({r_count} голосов)"
-        if description:
-            line += f"\n💬 {description}"
+        if description: line += f"\n💬 {description}"
         lines.append(line)
         buttons.append([{"text": f"❌ Удалить {ip}", "callback_data": f"delete_{sid}"}])
     markup = json.dumps({"inline_keyboard": buttons})
@@ -463,21 +566,34 @@ def build_edit_picker(servers):
 
 def build_stats(user_id):
     servers_count, fav_count, votes_given, total_views, total_votes_received, best = get_user_stats(user_id)
+    achieved = get_user_achievements(user_id)
     lines = ["<b>📊 Твоя статистика:</b>\n"]
     lines.append(f"🖥️ Добавлено серверов: <b>{servers_count}</b>")
     lines.append(f"⭐ В избранном (у тебя): <b>{fav_count}</b>")
     lines.append(f"🗳️ Оценок отдано: <b>{votes_given}</b>")
     lines.append(f"👁️ Просмотров твоих серверов: <b>{total_views}</b>")
-    lines.append(f"📥 Оценок получено твоими серверами: <b>{total_votes_received}</b>")
+    lines.append(f"📥 Оценок получено: <b>{total_votes_received}</b>")
     if best:
         lines.append(f"\n🏅 Лучший сервер: <code>{best[0]}</code>\n   {stars_bar(best[1])} ({best[2]} голосов)")
-    lines.append(f"\n<i>Голоса обновляются каждую неделю. До следующего сброса: {days_until_monday()} дн.</i>")
+    lines.append(f"\n🏆 Достижений: <b>{len(achieved)}/{len(ALL_ACHIEVEMENTS)}</b>")
+    lines.append(f"\n<i>До сброса голосов: {days_until_monday()} дн.</i>")
     return "\n".join(lines)
+
+def build_achievements_page(user_id):
+    achieved = get_user_achievements(user_id)
+    lines = [f"<b>🏅 Достижения</b> ({len(achieved)}/{len(ALL_ACHIEVEMENTS)}):\n"]
+    for code, (emoji, name, desc) in ALL_ACHIEVEMENTS.items():
+        if code in achieved:
+            date = achieved[code].strftime('%d.%m.%Y')
+            lines.append(f"{emoji} <b>{name}</b> — {desc}\n   <i>Получено {date}</i>")
+        else:
+            lines.append(f"🔒 <b>{name}</b> — <i>{desc}</i>")
+    return "\n\n".join(lines)
 
 # ─── Handler ──────────────────────────────────────────────────────────────────
 
 def handler(event: dict, context) -> dict:
-    """Telegram-бот каталог Minecraft-серверов: пинг, онлайн игроков, топ, избранное, пагинация, еженедельные оценки."""
+    """Telegram-бот каталог MC-серверов: пинг, рейтинг, топ, избранное, пагинация, достижения."""
     if event.get('httpMethod') == 'OPTIONS':
         return {'statusCode': 200, 'headers': {'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type'}, 'body': ''}
 
@@ -528,6 +644,8 @@ def handler(event: dict, context) -> dict:
             added = toggle_favorite(cb_user_id, server_id)
             label = "⭐ Добавлено в избранное!" if added else "Убрано из избранного"
             answer_callback(token, cb_id, label)
+            if added:
+                check_and_unlock(token, cb_chat_id, cb_user_id)
 
         elif cb_data.startswith('vote_'):
             server_id = int(cb_data.split('_')[1])
@@ -538,9 +656,8 @@ def handler(event: dict, context) -> dict:
             else:
                 sid, ip, version, description, hosting, rating, r_count = srv
                 existing_score = get_user_vote_this_week(cb_user_id, server_id)
-                note = f"\nТвоя текущая оценка: {'⭐' * existing_score} ({existing_score})" if existing_score else ""
-                send_message(
-                    token, cb_chat_id,
+                note = f"\nТвоя оценка: {'⭐' * existing_score} ({existing_score})" if existing_score else ""
+                send_message(token, cb_chat_id,
                     f"<b>Оцени сервер</b> <code>{ip}</code>\n"
                     f"{stars_bar(rating)} ({r_count} голосов){note}\n\n"
                     f"Выбери оценку (голос действует 1 неделю):",
@@ -559,11 +676,14 @@ def handler(event: dict, context) -> dict:
                 label_score = SCORE_LABELS.get(score, str(score))
                 if is_new:
                     answer_callback(token, cb_id, f"{label_score} — голос принят!")
-                    msg = f"✅ Ты оценил сервер на {'⭐' * score} ({score}/5)\n<i>Можешь изменить оценку до конца недели.</i>"
+                    send_message(token, cb_chat_id,
+                        f"✅ Ты оценил сервер на {'⭐' * score} ({score}/5)\n"
+                        f"<i>Можешь изменить оценку до конца недели.</i>"
+                    )
                 else:
                     answer_callback(token, cb_id, f"Оценка обновлена: {score}/5")
-                    msg = f"🔄 Оценка обновлена: {'⭐' * score} ({score}/5)"
-                send_message(token, cb_chat_id, msg)
+                    send_message(token, cb_chat_id, f"🔄 Оценка обновлена: {'⭐' * score} ({score}/5)")
+                check_and_unlock(token, cb_chat_id, cb_user_id)
 
         return {'statusCode': 200, 'headers': {'Access-Control-Allow-Origin': '*'}, 'body': ''}
 
@@ -582,7 +702,7 @@ def handler(event: dict, context) -> dict:
         user_states.pop(user_id, None)
         send_message(token, chat_id,
             "⛏️ <b>Добро пожаловать в каталог Minecraft-серверов!</b>\n\n"
-            "Добавляй свой сервер, ищи новый, сохраняй в избранное и голосуй за лучшие!\n\n"
+            "Добавляй серверы, голосуй, собирай ачивки и попади в топ!\n\n"
             "Выбери действие:",
             get_main_keyboard()
         )
@@ -632,8 +752,10 @@ def handler(event: dict, context) -> dict:
             send_message(token, chat_id, msg, markup)
 
     elif text == '📊 МОЯ СТАТИСТИКА':
-        msg = build_stats(user_id)
-        send_message(token, chat_id, msg, get_main_keyboard())
+        send_message(token, chat_id, build_stats(user_id), get_main_keyboard())
+
+    elif text == '🏅 МОИ АЧИВКИ':
+        send_message(token, chat_id, build_achievements_page(user_id), get_main_keyboard())
 
     # ── Шаги добавления ───────────────────────────────────────────────────────
     elif state and state.get('step') == 'await_hosting':
@@ -668,8 +790,8 @@ def handler(event: dict, context) -> dict:
             f"<b>Статус:</b> {status_line}",
             get_main_keyboard()
         )
+        check_and_unlock(token, chat_id, user_id)
 
-    # ── Редактирование описания ────────────────────────────────────────────────
     elif state and state.get('step') == 'await_new_desc':
         server_id = state['server_id']
         new_desc = None if text == '-' else text
