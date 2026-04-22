@@ -1,14 +1,26 @@
 import json
 import os
 import socket
+import random
+import struct
 import psycopg2
 import urllib.request
 
 SCHEMA = os.environ.get('MAIN_DB_SCHEMA', 't_p38250381_mc_server_bot')
 PAGE_SIZE = 5
+
 user_states = {}
 
-# ─── Telegram helpers ────────────────────────────────────────────────────────
+LAUNCH_PHRASES = [
+    "🚀 Твой сервер теперь в космосе! Полетели искать игроков!",
+    "⛏️ Добавлено в каталог. Пусть алмазы сами идут к тебе!",
+    "🌍 Сервер на орбите! Скоро к тебе придут первые игроки.",
+    "🎮 Готово! Ещё один сервер покорит просторы блочного мира.",
+    "✨ Принято! Надеюсь, на твоём сервере нет гриферов 😄",
+    "🏆 Запись добавлена. Может именно твой сервер станет топ-1?",
+]
+
+# ─── Telegram ─────────────────────────────────────────────────────────────────
 
 def send_message(token, chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -32,12 +44,13 @@ def get_main_keyboard():
     return json.dumps({
         "keyboard": [
             [{"text": "➕ ДОБАВИТЬ СЕРВЕР"}, {"text": "🌐 СЕРВЕРЫ"}],
+            [{"text": "🏆 ТОП СЕРВЕРОВ"}, {"text": "⭐ ИЗБРАННОЕ"}],
             [{"text": "📋 МОИ СЕРВЕРЫ"}, {"text": "✏️ ИЗМЕНИТЬ ОПИСАНИЕ"}]
         ],
         "resize_keyboard": True
     })
 
-# ─── DB helpers ───────────────────────────────────────────────────────────────
+# ─── DB ───────────────────────────────────────────────────────────────────────
 
 def get_db_conn():
     return psycopg2.connect(os.environ['DATABASE_URL'])
@@ -57,7 +70,7 @@ def get_servers_page(page):
     cur = conn.cursor()
     offset = page * PAGE_SIZE
     cur.execute(
-        f"SELECT ip, version, username, added_at, description, hosting FROM {SCHEMA}.servers ORDER BY added_at DESC LIMIT %s OFFSET %s",
+        f"SELECT ip, version, username, added_at, description, hosting, views FROM {SCHEMA}.servers ORDER BY added_at DESC LIMIT %s OFFSET %s",
         (PAGE_SIZE, offset)
     )
     rows = cur.fetchall()
@@ -65,6 +78,16 @@ def get_servers_page(page):
     total = cur.fetchone()[0]
     cur.close(); conn.close()
     return rows, total
+
+def get_top_servers():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT id, ip, version, username, description, hosting, views FROM {SCHEMA}.servers ORDER BY views DESC LIMIT 10"
+    )
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
 
 def get_user_servers(user_id):
     conn = get_db_conn()
@@ -98,34 +121,129 @@ def update_description(server_id, user_id, description):
     cur.close(); conn.close()
     return updated > 0
 
-# ─── Ping ─────────────────────────────────────────────────────────────────────
+def increment_views(server_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE {SCHEMA}.servers SET views = views + 1 WHERE id = %s", (server_id,))
+    conn.commit()
+    cur.close(); conn.close()
 
-def ping_server(ip_port: str) -> bool:
-    """Проверяет доступность сервера по TCP (порт 25565 по умолчанию)."""
+def toggle_favorite(user_id, server_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(f"SELECT id FROM {SCHEMA}.favorites WHERE user_id = %s AND server_id = %s", (user_id, server_id))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute(f"DELETE FROM {SCHEMA}.favorites WHERE user_id = %s AND server_id = %s", (user_id, server_id))
+        added = False
+    else:
+        cur.execute(f"INSERT INTO {SCHEMA}.favorites (user_id, server_id) VALUES (%s, %s)", (user_id, server_id))
+        added = True
+    conn.commit()
+    cur.close(); conn.close()
+    return added
+
+def get_favorites(user_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        f"""SELECT s.id, s.ip, s.version, s.description, s.hosting, s.views
+            FROM {SCHEMA}.favorites f
+            JOIN {SCHEMA}.servers s ON s.id = f.server_id
+            WHERE f.user_id = %s ORDER BY f.added_at DESC""",
+        (user_id,)
+    )
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def get_user_favorite_ids(user_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(f"SELECT server_id FROM {SCHEMA}.favorites WHERE user_id = %s", (user_id,))
+    ids = {row[0] for row in cur.fetchall()}
+    cur.close(); conn.close()
+    return ids
+
+# ─── Minecraft Server List Ping ───────────────────────────────────────────────
+
+def get_mc_status(ip_port: str):
+    """Получает онлайн-статус и количество игроков через протокол Minecraft 1.7+."""
     try:
         if ':' in ip_port:
             host, port = ip_port.rsplit(':', 1)
             port = int(port)
         else:
             host, port = ip_port, 25565
+
         sock = socket.create_connection((host, port), timeout=3)
+
+        def pack_varint(val):
+            result = b''
+            while True:
+                part = val & 0x7F
+                val >>= 7
+                if val:
+                    part |= 0x80
+                result += bytes([part])
+                if not val:
+                    break
+            return result
+
+        def read_varint(s):
+            result, shift = 0, 0
+            while True:
+                b = s.recv(1)
+                if not b:
+                    return 0
+                val = b[0]
+                result |= (val & 0x7F) << shift
+                if not (val & 0x80):
+                    return result
+                shift += 7
+
+        host_encoded = host.encode('utf-8')
+        handshake = (
+            pack_varint(0x00) +
+            pack_varint(47) +
+            pack_varint(len(host_encoded)) +
+            host_encoded +
+            struct.pack('>H', port) +
+            pack_varint(1)
+        )
+        sock.sendall(pack_varint(len(handshake)) + handshake)
+        sock.sendall(pack_varint(1) + pack_varint(0x00))
+
+        read_varint(sock)
+        read_varint(sock)
+        length = read_varint(sock)
+        data = b''
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
+            if not chunk:
+                break
+            data += chunk
         sock.close()
-        return True
+
+        response = json.loads(data)
+        players = response.get('players', {})
+        return True, players.get('online', 0), players.get('max', 0)
     except Exception:
-        return False
+        return False, 0, 0
 
 # ─── UI builders ──────────────────────────────────────────────────────────────
 
 def build_servers_page(servers, page, total):
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     lines = [f"<b>🌐 Список серверов</b> (стр. {page + 1}/{total_pages}):\n"]
-    for i, (ip, version, uname, added_at, description, hosting) in enumerate(servers, page * PAGE_SIZE + 1):
+    for i, (ip, version, uname, added_at, description, hosting, views) in enumerate(servers, page * PAGE_SIZE + 1):
+        online, pl_on, pl_max = get_mc_status(ip)
         date_str = added_at.strftime('%d.%m.%Y') if added_at else ''
-        status = "🟢" if ping_server(ip) else "🔴"
-        line = f"{status} {i}. <code>{ip}</code>"
+        status = f"🟢 {pl_on}/{pl_max}" if online else "🔴"
+        line = f"{i}. <code>{ip}</code>"
         if hosting:
-            line += f" [{hosting}]"
-        line += f"\nВерсия: {version} | @{uname} | {date_str}"
+            line += f" <i>[{hosting}]</i>"
+        line += f"\nВерсия: {version} | {status} | 👁 {views} | @{uname} {date_str}"
         if description:
             line += f"\n💬 {description}"
         lines.append(line)
@@ -139,13 +257,54 @@ def build_servers_page(servers, page, total):
     markup = json.dumps({"inline_keyboard": [nav_buttons]}) if nav_buttons else None
     return "\n".join(lines), markup
 
+def build_top_servers(servers, user_id):
+    fav_ids = get_user_favorite_ids(user_id)
+    lines = ["<b>🏆 Топ серверов по просмотрам:</b>\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    inline_buttons = []
+    for i, (sid, ip, version, uname, description, hosting, views) in enumerate(servers):
+        online, pl_on, pl_max = get_mc_status(ip)
+        medal = medals[i] if i < 3 else f"{i+1}."
+        status = f"🟢 {pl_on}/{pl_max}" if online else "🔴"
+        star = "⭐" if sid in fav_ids else ""
+        line = f"{medal} {star}<code>{ip}</code>"
+        if hosting:
+            line += f" <i>[{hosting}]</i>"
+        line += f"\nВерсия: {version} | {status} | 👁 {views}"
+        if description:
+            line += f"\n💬 {description}"
+        lines.append(line)
+        fav_label = "★ Убрать из избранного" if sid in fav_ids else "☆ В избранное"
+        inline_buttons.append([{"text": fav_label, "callback_data": f"fav_{sid}"}])
+    markup = json.dumps({"inline_keyboard": inline_buttons})
+    return "\n".join(lines), markup
+
+def build_favorites(servers, user_id):
+    if not servers:
+        return "У вас нет избранных серверов.\nДобавляйте серверы из раздела 🏆 Топ!", None
+    lines = ["<b>⭐ Избранные серверы:</b>\n"]
+    inline_buttons = []
+    for sid, ip, version, description, hosting, views in servers:
+        online, pl_on, pl_max = get_mc_status(ip)
+        status = f"🟢 {pl_on}/{pl_max}" if online else "🔴"
+        line = f"⭐ <code>{ip}</code>"
+        if hosting:
+            line += f" <i>[{hosting}]</i>"
+        line += f"\nВерсия: {version} | {status} | 👁 {views}"
+        if description:
+            line += f"\n💬 {description}"
+        lines.append(line)
+        inline_buttons.append([{"text": "★ Убрать из избранного", "callback_data": f"fav_{sid}"}])
+    markup = json.dumps({"inline_keyboard": inline_buttons})
+    return "\n".join(lines), markup
+
 def build_my_servers(servers):
     lines = ["<b>📋 Мои серверы:</b>\n"]
     buttons = []
     for i, (sid, ip, version, description, hosting) in enumerate(servers, 1):
         line = f"{i}. <code>{ip}</code>"
         if hosting:
-            line += f" [{hosting}]"
+            line += f" <i>[{hosting}]</i>"
         line += f"\nВерсия: {version}"
         if description:
             line += f"\n💬 {description}"
@@ -166,7 +325,7 @@ def build_edit_picker(servers):
 # ─── Handler ──────────────────────────────────────────────────────────────────
 
 def handler(event: dict, context) -> dict:
-    """Telegram-бот для пиара серверов Minecraft с пагинацией, хостингом, пингом и редактированием."""
+    """Telegram-бот каталог Minecraft-серверов: пинг, онлайн игроков, топ, избранное, пагинация."""
     if event.get('httpMethod') == 'OPTIONS':
         return {'statusCode': 200, 'headers': {'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type'}, 'body': ''}
 
@@ -209,7 +368,14 @@ def handler(event: dict, context) -> dict:
             server_id = int(cb_data.split('_')[1])
             answer_callback(token, cb_id)
             user_states[cb_user_id] = {'step': 'await_new_desc', 'server_id': server_id}
-            send_message(token, cb_chat_id, "Введите новое описание для сервера (или <b>-</b> чтобы убрать описание):")
+            send_message(token, cb_chat_id, "Введите новое описание (или <b>-</b> чтобы убрать):")
+
+        elif cb_data.startswith('fav_'):
+            server_id = int(cb_data.split('_')[1])
+            increment_views(server_id)
+            added = toggle_favorite(cb_user_id, server_id)
+            label = "⭐ Добавлено в избранное!" if added else "Убрано из избранного"
+            answer_callback(token, cb_id, label)
 
         return {'statusCode': 200, 'headers': {'Access-Control-Allow-Origin': '*'}, 'body': ''}
 
@@ -228,7 +394,7 @@ def handler(event: dict, context) -> dict:
         user_states.pop(user_id, None)
         send_message(token, chat_id,
             "⛏️ <b>Добро пожаловать в каталог Minecraft-серверов!</b>\n\n"
-            "Здесь ты можешь добавить свой сервер или найти новый.\n"
+            "Добавляй свой сервер, ищи новый или сохраняй в избранное.\n\n"
             "Выбери действие:",
             get_main_keyboard()
         )
@@ -236,8 +402,8 @@ def handler(event: dict, context) -> dict:
     elif text == '➕ ДОБАВИТЬ СЕРВЕР':
         user_states[user_id] = {'step': 'await_hosting'}
         send_message(token, chat_id,
-            "🖥️ На каком хостинге держится твой сервер?\n\n"
-            "<i>Например: Aternos, Minehut, своя VPS, домашний ПК и т.д.</i>"
+            "🖥️ <b>На каком хостинге держится твой сервер?</b>\n\n"
+            "<i>Например: Aternos, Minehut, своя VPS, домашний ПК...</i>"
         )
 
     elif text == '🌐 СЕРВЕРЫ':
@@ -247,6 +413,19 @@ def handler(event: dict, context) -> dict:
         else:
             msg, markup = build_servers_page(servers, 0, total)
             send_message(token, chat_id, msg, markup)
+
+    elif text == '🏆 ТОП СЕРВЕРОВ':
+        servers = get_top_servers()
+        if not servers:
+            send_message(token, chat_id, "Серверов пока нет.", get_main_keyboard())
+        else:
+            msg, markup = build_top_servers(servers, user_id)
+            send_message(token, chat_id, msg, markup)
+
+    elif text == '⭐ ИЗБРАННОЕ':
+        servers = get_favorites(user_id)
+        msg, markup = build_favorites(servers, user_id)
+        send_message(token, chat_id, msg, markup if markup else get_main_keyboard())
 
     elif text == '📋 МОИ СЕРВЕРЫ':
         servers = get_user_servers(user_id)
@@ -264,14 +443,14 @@ def handler(event: dict, context) -> dict:
             msg, markup = build_edit_picker(servers)
             send_message(token, chat_id, msg, markup)
 
-    # ── Шаги добавления сервера ───────────────────────────────────────────────
+    # ── Шаги добавления ───────────────────────────────────────────────────────
     elif state and state.get('step') == 'await_hosting':
         user_states[user_id] = {'step': 'await_ip', 'hosting': text}
         send_message(token, chat_id, f"Хостинг: <b>{text}</b> ✅\n\nТеперь введите <b>IP-адрес</b> сервера:")
 
     elif state and state.get('step') == 'await_ip':
         user_states[user_id] = {**state, 'step': 'await_version', 'ip': text}
-        send_message(token, chat_id, f"IP принят: <code>{text}</code>\n\nВведите <b>версию</b> сервера (например: 1.20.4):")
+        send_message(token, chat_id, f"IP принят: <code>{text}</code> ✅\n\nВведите <b>версию</b> сервера (например: 1.20.4):")
 
     elif state and state.get('step') == 'await_version':
         user_states[user_id] = {**state, 'step': 'await_description', 'version': text}
@@ -284,15 +463,17 @@ def handler(event: dict, context) -> dict:
         description = None if text == '-' else text
         add_server(user_id, username, hosting, ip, version, description)
         user_states.pop(user_id, None)
-        online = "🟢 Онлайн" if ping_server(ip) else "🔴 Недоступен"
+        online, pl_on, pl_max = get_mc_status(ip)
+        status_line = f"🟢 Онлайн ({pl_on}/{pl_max} игроков)" if online else "🔴 Сейчас недоступен"
         desc_line = f"\n💬 <b>Описание:</b> {description}" if description else ""
         hosting_line = f"\n🖥️ <b>Хостинг:</b> {hosting}" if hosting else ""
+        phrase = random.choice(LAUNCH_PHRASES)
         send_message(token, chat_id,
-            f"✅ Сервер успешно добавлен!\n\n"
+            f"{phrase}\n\n"
             f"<b>IP:</b> <code>{ip}</code>\n"
             f"<b>Версия:</b> {version}"
             f"{hosting_line}{desc_line}\n"
-            f"<b>Статус:</b> {online}",
+            f"<b>Статус:</b> {status_line}",
             get_main_keyboard()
         )
 
