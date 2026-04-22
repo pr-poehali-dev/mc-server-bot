@@ -1,0 +1,10 @@
+{
+  "tests": [
+    {
+      "name": "Health check - OPTIONS",
+      "method": "OPTIONS",
+      "path": "/",
+      "expectedStatus": 200
+    }
+  ]
+}
