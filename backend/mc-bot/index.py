@@ -41,12 +41,12 @@ def get_main_keyboard():
 def get_db_conn():
     return psycopg2.connect(os.environ['DATABASE_URL'])
 
-def add_server(user_id, username, ip, version):
+def add_server(user_id, username, ip, version, description=None):
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute(
-        f"INSERT INTO {SCHEMA}.servers (user_id, username, ip, version) VALUES (%s, %s, %s, %s)",
-        (user_id, username, ip, version)
+        f"INSERT INTO {SCHEMA}.servers (user_id, username, ip, version, description) VALUES (%s, %s, %s, %s, %s)",
+        (user_id, username, ip, version, description)
     )
     conn.commit()
     cur.close()
@@ -55,7 +55,7 @@ def add_server(user_id, username, ip, version):
 def get_servers():
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute(f"SELECT ip, version, username, added_at FROM {SCHEMA}.servers ORDER BY added_at DESC LIMIT 50")
+    cur.execute(f"SELECT ip, version, username, added_at, description FROM {SCHEMA}.servers ORDER BY added_at DESC LIMIT 50")
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -64,7 +64,7 @@ def get_servers():
 def get_user_servers(user_id):
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute(f"SELECT id, ip, version FROM {SCHEMA}.servers WHERE user_id = %s ORDER BY added_at DESC", (user_id,))
+    cur.execute(f"SELECT id, ip, version, description FROM {SCHEMA}.servers WHERE user_id = %s ORDER BY added_at DESC", (user_id,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -119,8 +119,11 @@ def handler(event: dict, context) -> dict:
                 else:
                     inline_buttons = []
                     lines = ["<b>Мои серверы:</b>\n"]
-                    for i, (sid, ip, version) in enumerate(servers, 1):
-                        lines.append(f"{i}. <code>{ip}</code>\nВерсия: {version}")
+                    for i, (sid, ip, version, description) in enumerate(servers, 1):
+                        line = f"{i}. <code>{ip}</code>\nВерсия: {version}"
+                        if description:
+                            line += f"\n{description}"
+                        lines.append(line)
                         inline_buttons.append([{"text": f"❌ Удалить {ip}", "callback_data": f"delete_{sid}"}])
                     markup = json.dumps({"inline_keyboard": inline_buttons})
                     send_message(token, cb_chat_id, "\n".join(lines), markup)
@@ -157,9 +160,12 @@ def handler(event: dict, context) -> dict:
             send_message(token, chat_id, "Серверов пока нет. Будьте первым — нажмите «ДОБАВИТЬ СЕРВЕР».", get_main_keyboard())
         else:
             lines = ["<b>Список серверов:</b>\n"]
-            for i, (ip, version, uname, added_at) in enumerate(servers, 1):
+            for i, (ip, version, uname, added_at, description) in enumerate(servers, 1):
                 date_str = added_at.strftime('%d.%m.%Y') if added_at else ''
-                lines.append(f"{i}. <code>{ip}</code>\nВерсия: {version} | Добавил: @{uname} | {date_str}")
+                line = f"{i}. <code>{ip}</code>\nВерсия: {version} | Добавил: @{uname} | {date_str}"
+                if description:
+                    line += f"\n{description}"
+                lines.append(line)
             send_message(token, chat_id, "\n".join(lines), get_main_keyboard())
 
     elif text == 'МОИ СЕРВЕРЫ':
@@ -169,8 +175,11 @@ def handler(event: dict, context) -> dict:
         else:
             inline_buttons = []
             lines = ["<b>Мои серверы:</b>\n"]
-            for i, (sid, ip, version) in enumerate(servers, 1):
-                lines.append(f"{i}. <code>{ip}</code>\nВерсия: {version}")
+            for i, (sid, ip, version, description) in enumerate(servers, 1):
+                line = f"{i}. <code>{ip}</code>\nВерсия: {version}"
+                if description:
+                    line += f"\n{description}"
+                lines.append(line)
                 inline_buttons.append([{"text": f"❌ Удалить {ip}", "callback_data": f"delete_{sid}"}])
             markup = json.dumps({"inline_keyboard": inline_buttons})
             send_message(token, chat_id, "\n".join(lines), markup)
@@ -180,12 +189,18 @@ def handler(event: dict, context) -> dict:
         send_message(token, chat_id, f"IP принят: <code>{text}</code>\n\nТеперь введите версию сервера (например: 1.20.4):")
 
     elif state and state.get('step') == 'await_version':
+        user_states[user_id] = {'step': 'await_description', 'ip': state['ip'], 'version': text}
+        send_message(token, chat_id, f"Версия принята: <b>{text}</b>\n\nВведите описание сервера (или отправьте <b>-</b> чтобы пропустить):")
+
+    elif state and state.get('step') == 'await_description':
         ip = state['ip']
-        version = text
-        add_server(user_id, username, ip, version)
+        version = state['version']
+        description = None if text == '-' else text
+        add_server(user_id, username, ip, version, description)
         user_states.pop(user_id, None)
+        desc_line = f"\n<b>Описание:</b> {description}" if description else ""
         send_message(token, chat_id,
-            f"Сервер успешно добавлен.\n\n<b>IP:</b> <code>{ip}</code>\n<b>Версия:</b> {version}",
+            f"Сервер успешно добавлен.\n\n<b>IP:</b> <code>{ip}</code>\n<b>Версия:</b> {version}{desc_line}",
             get_main_keyboard()
         )
 

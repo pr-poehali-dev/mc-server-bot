@@ -1,0 +1,1 @@
+ALTER TABLE t_p38250381_mc_server_bot.servers ADD COLUMN description text NULL;
